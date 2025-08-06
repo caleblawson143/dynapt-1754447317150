@@ -1,0 +1,96 @@
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CONTAINER_APP_NAME: ${{ github.event.repository.name }}-${{ github.run_number }}
+  AZURE_RESOURCE_GROUP: Hosted-Websites
+  AZURE_LOCATION: westus2
+  AZURE_CONTAINER_APPS_ENV: hosted-websites-prod
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: ${{ hashFiles('package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock') != '' && 'npm' || '' }}
+
+    - name: Install dependencies
+      run: |
+        if [ -f package.json ]; then
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            echo "Lock file found, using npm ci for clean install"
+            npm ci
+          else
+            echo "No lock file found, using npm install"
+            npm install
+          fi
+        else
+          echo "No package.json found, skipping npm install"
+        fi
+
+    - name: Build application
+      run: |
+        if [ -f package.json ] && npm run build --if-present; then
+          echo "Build completed successfully"
+        else
+          echo "No build script found or static files only"
+          mkdir -p dist
+          cp -r . dist/ || true
+        fi
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Deploy to Azure Container Apps
+      run: |
+        # Create or update container app
+        az containerapp up \
+          --name ${{ env.AZURE_CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --location ${{ env.AZURE_LOCATION }} \
+          --environment ${{ env.AZURE_CONTAINER_APPS_ENV }} \
+          --source . \
+          --target-port 3000 \
+          --ingress external
+
+    - name: Get Container App URL
+      id: get-url
+      run: |
+        URL=$(az containerapp show \
+          --name ${{ env.AZURE_CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --query "properties.configuration.ingress.fqdn" \
+          --output tsv)
+        echo "url=https://$URL" >> $GITHUB_OUTPUT
+
+    - name: Comment deployment URL
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '🚀 Deployment successful! Your website is available at: ${{ steps.get-url.outputs.url }}'
+          });
